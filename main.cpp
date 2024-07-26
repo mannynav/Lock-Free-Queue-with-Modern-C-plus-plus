@@ -5,7 +5,6 @@
 #include <array>
 #include <random>
 #include <ranges>
-#include "Timer.h"
 #include <cmath>
 #include <thread>
 #include <mutex>
@@ -17,7 +16,6 @@
 #include <condition_variable>
 #include "Timer.h"
 
-
 // test settings
 constexpr size_t WorkerCount = 4;
 constexpr size_t BlockCount = 1000;
@@ -25,10 +23,17 @@ constexpr size_t BlockSize = 16'000;
 constexpr size_t SubsetSize = BlockSize / WorkerCount;
 constexpr size_t LightIterations = 2;
 constexpr size_t HeavyIterations = 20;
-constexpr double HeavyProbability = 0.15;
+constexpr double ProbabilityOfHeavy = 0.15;
 
 static_assert(BlockCount >= WorkerCount);
 static_assert(BlockSize% WorkerCount == 0);
+
+struct BlockInfo
+{
+	std::array<float, WorkerCount> ThreadWorkTime;
+	std::array<size_t, WorkerCount> HeaviesPerThread;
+	float TotalBlockTime;
+};
 
 struct Task
 {
@@ -37,8 +42,8 @@ struct Task
 
 	unsigned int Process() const
 	{
-		const auto iterations = heavy ? HeavyIterations : LightIterations;
-		auto intermediate = value;
+		const auto iterations = heavy ? HeavyIterations : LightIterations;			//heavy will be true or false, based on the 1 or 0 from the bernoulli distribution
+		auto intermediate = value;													//random value from the uniform distribution
 
 		for (size_t i = 0; i < iterations; ++i)
 		{
@@ -50,37 +55,33 @@ struct Task
 
 	}
 };
-struct BlockInfo
-{
-	std::array<float, WorkerCount> ThreadWorkTime;
-	std::array<size_t, WorkerCount> HeaviesPerThread;
-	float TotalBlockTime;
-};
 
-std::vector<std::array<Task, BlockSize>> UnstructuredData()
+
+std::vector<std::array<Task, BlockSize>> FillWithUnstructuredTasks()
 {
-	std::minstd_rand rne; //starts off with default seed. sum should be the same
-	std::bernoulli_distribution distribution{ HeavyProbability };
-	std::uniform_real_distribution<> uniform_distributionn{ 0,std::numbers::pi };
+	std::minstd_rand rne;																   //starts off with default seed. sum should be the same
+	std::bernoulli_distribution distribution{ ProbabilityOfHeavy };
+	std::uniform_real_distribution<> uniform_distribution{ 0,std::numbers::pi };
 
 	std::vector<std::array<Task, BlockSize>> blocks(BlockCount);
 
+	//fill each block with random tasks
 	for (auto& block : blocks)
 	{
 		std::ranges::generate(block, [&]() -> Task {
-			return Task{ .value = uniform_distributionn(rne),.heavy = distribution(rne) };
+			return Task{ .value = uniform_distribution(rne),.heavy = distribution(rne) };
 			}
 		);
 	}
 
 	return blocks;
 }
-std::vector<std::array<Task, BlockSize>> StructuredData()
+std::vector<std::array<Task, BlockSize>> FillWithStructuredTasks()
 {
 	std::minstd_rand rne; //starts off with default seed. sum should be the same
 	std::uniform_real_distribution<> uniform_distribution{ 0,std::numbers::pi };
 
-	const int everyNth = int(1.0 / HeavyProbability);
+	const int everyNth = int(1.0 / ProbabilityOfHeavy);
 
 	std::vector<std::array<Task, BlockSize>> blocks(BlockCount);
 
@@ -94,9 +95,9 @@ std::vector<std::array<Task, BlockSize>> StructuredData()
 	}
 	return blocks;
 }
-std::vector<std::array<Task, BlockSize>> FrontLoadedData()
+std::vector<std::array<Task, BlockSize>> FillWithFrontLoadedTasks()
 {
-	auto blocks = StructuredData();
+	auto blocks = FillWithStructuredTasks();
 
 	for (auto& block : blocks) {
 		std::ranges::partition(block, std::identity{}, &Task::heavy);
@@ -113,12 +114,12 @@ public:
 
 	Manager() : lock{ mtx } {}
 
-	void SignalDone() //called from a worker
+	void SignalDone()								//called from a worker, worker wants the mutex
 	{
 		bool needsNotification = false;
 		{
 			std::lock_guard lk{ mtx };
-			++doneCount;
+			++doneCount;							//modified under a mutex by each worker thread.
 			if (doneCount == WorkerCount)
 			{
 				needsNotification = true;
@@ -126,19 +127,19 @@ public:
 		}
 		if (needsNotification)
 		{
-			cv.notify_one(); //notify cv of the master that its time to wake up
+			cv.notify_one();						//notify cv of the master that its time to wake up since all work is done.
 		}
 	}
 
 	void WaitForAllDone()
 	{
-		cv.wait(lock, [this] {return doneCount == WorkerCount; });
+		cv.wait(lock, [this] {return doneCount == WorkerCount; });		//master will wake once all work is done.
 		doneCount = 0;
 	}
 
 private:
 
-	std::condition_variable cv;
+	std::condition_variable cv;						//worker will use this to signal they are done
 	std::mutex mtx;
 	std::unique_lock<std::mutex> lock;
 
@@ -150,13 +151,13 @@ class Worker
 public:
 	Worker(Manager* pMaster) : manager_ptr(pMaster), thread(&Worker::Run_, this) {}
 
-	void SetJob(std::span<const Task> data)
+	void SetJob(std::span<const Task> data)						//function called by main
 	{
 		{
 			std::lock_guard lk{ mutex_ };
-			input = data;
+			inputTasks_ = data;
 		}
-		cv.notify_one();
+		cv.notify_one();										//wake up the condition variable to check if we have a job
 	}
 
 	void Kill()
@@ -171,17 +172,14 @@ public:
 	{
 		return ProcessAccumulation_;
 	}
-
 	float GetJobWorkTime() const
 	{
 		return JobTime_;
 	}
-
 	size_t GetNumHeavyItemsProcessed() const
 	{
 		return NumberHeavyItemsProcessed_;
 	}
-
 	~Worker()
 	{
 		Kill();
@@ -189,10 +187,10 @@ public:
 
 private:
 
-	void ProcessData_()
+	void ProcessTasks_()
 	{
 		NumberHeavyItemsProcessed_ = 0;
-		for (const auto& task : input)
+		for (auto& task : inputTasks_)														//inputTasks_ is set in SetJob
 		{
 			ProcessAccumulation_ += task.Process();
 			NumberHeavyItemsProcessed_ += task.heavy ? 1 : 0;
@@ -205,35 +203,32 @@ private:
 		while (true)
 		{
 			Timer timer;
-			cv.wait(lk, [this] {return !input.empty() || IsDying_; });
+			cv.wait(lk, [this] {return !inputTasks_.empty() || IsDying_; }); //cv will wait for a job. Pred will return true if we have a job or we are dying, so the thread wakes up
 
-			//once we are awake
-			if (IsDying_)
+			
+			if (IsDying_)																	//if we are dying, we break out of the loop
 			{
 				break;
 			}
 
 			timer.Mark();
-
-			//we must have some work
-			ProcessData_();
-
+			ProcessTasks_();																//we must have some work
 			JobTime_ = timer.Peek();
 
-			input = {};
+			inputTasks_ = {};
 			manager_ptr->SignalDone();
 		}
 	}
 
 	Manager* manager_ptr;
-	std::jthread thread;
+	std::jthread thread;																	//will be started in worker constructor
 	std::condition_variable cv;
 	std::mutex mutex_;
 
 	//shared memory
-	std::span<const Task> input;
+	std::span<const Task> inputTasks_;
 	unsigned int ProcessAccumulation_ = 0;
-	bool IsDying_ = false;
+	bool IsDying_ = false;						// flag to set when worker thread is terminating
 	float JobTime_ = -1.f;
 
 	size_t NumberHeavyItemsProcessed_{};
@@ -246,11 +241,11 @@ int RunExperiment(bool stacked)
 		{
 			if (stacked)
 			{
-				return FrontLoadedData();
+				return FillWithFrontLoadedTasks();
 			}
 			else
 			{
-				return StructuredData();
+				return FillWithStructuredTasks();
 			}
 		}();
 
@@ -272,12 +267,13 @@ int RunExperiment(bool stacked)
 
 	Timer BlockTimer;
 
-	for (auto block : blocks)
+	for (auto block : blocks)									//each block is an array of tasks
 	{
 		BlockTimer.Mark();
 		for (size_t iSubset = 0; iSubset < WorkerCount; ++iSubset)
 		{
 			WorkerPtrs[iSubset]->SetJob(std::span{ &block[iSubset * SubsetSize], SubsetSize });
+			
 		}
 		manager.WaitForAllDone();
 		const auto BlockTime = BlockTimer.Peek();
@@ -304,8 +300,7 @@ int RunExperiment(bool stacked)
 
 	std::cout << "result is: " << finalResult << std::endl;
 
-	//output csv of chunk timings
-	// worktime, idletime, numberofheavies x workers + total time, total heavies
+	////////////////// Output to csv //////////////////////
 
 	std::ofstream csv("ResultsTime.csv", std::ios_base::trunc);
 
@@ -314,24 +309,23 @@ int RunExperiment(bool stacked)
 		csv << std::format("work_{0:},idle{0:},heavy_{0:},", i);
 	}
 
-	csv << "chunktime, total_idle, total_heavy\n";
+	csv << "Block Time, Total Idle, Total Heavy\n";
 
-	for (const auto& chunk : timings)
+	for (const auto& block : timings)
 	{
 		float totalIdle = 0;
 		size_t totalHeavy = 0;
 
 		for (size_t i = 0; i < WorkerCount; i++)
 		{
-			const auto idle = chunk.TotalBlockTime - chunk.ThreadWorkTime[i];
-			const auto heavy = chunk.HeaviesPerThread[i];
-			csv << std::format("{},{},{},", chunk.ThreadWorkTime[i], idle, heavy);
+			const auto idle = block.TotalBlockTime - block.ThreadWorkTime[i];
+			const auto heavy = block.HeaviesPerThread[i];
+			csv << std::format("{},{},{},", block.ThreadWorkTime[i], idle, heavy);
 			totalIdle += idle;
 			totalHeavy += heavy;
 		}
 
-		csv << std::format("{},{},{}\n", chunk.TotalBlockTime, totalIdle, totalHeavy);
-
+		csv << std::format("{},{},{}\n", block.TotalBlockTime, totalIdle, totalHeavy);
 	}
 
 	return 0;
@@ -500,11 +494,11 @@ int RunQueuedExperiment(bool stacked)
 		{
 			if (stacked)
 			{
-				return FrontLoadedData();
+				return FillWithFrontLoadedTasks();
 			}
 			else
 			{
-				return StructuredData();
+				return FillWithStructuredTasks();
 			}
 		}();
 
@@ -592,8 +586,7 @@ int RunQueuedExperiment(bool stacked)
 
 int main(int argc, char** argv)
 {
-	using namespace std::string_literals;
 	bool stacked = false;
 
-	return RunExperiment(stacked);
+	return RunQueuedExperiment(stacked);
 }
